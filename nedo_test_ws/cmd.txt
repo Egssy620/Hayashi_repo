@@ -1,0 +1,113 @@
+================================================
+シャトル運転システム - ビルドから実行まで
+================================================
+
+■ メインPC 側 (走行制御ノード群)
+================================================
+
+# === 初回ビルド ===
+cd ~/nedo_test_ws
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install
+source install/setup.bash
+
+# === 実行 ===
+# 1. 自己位置推定 (rover_odom_to_pose2d は launch に含まれていないので別途起動)
+ros2 run rover_odom_to_pose2d rover_odom_to_pose2d_node &
+
+# 2. シャトルシステム起動 (ouster + depth_clustering + points_projection
+#    + heading + drive + cmd_vel_mux + manage + static_tf)
+ros2 launch manage_node shuttle_system.launch.py
+
+# === パラメータ上書き例 ===
+ros2 launch manage_node shuttle_system.launch.py obstacle_avoid_radius:=0.7
+ros2 launch manage_node shuttle_system.launch.py robot_radius:=0.3 lookahead_distance:=0.6
+
+# === 停止 ===
+# Ctrl+C で最大7秒で全ノード終了 (sigterm_timeout=2, sigkill_timeout=5)
+# または別ターミナルから:
+pkill -f "ros2 launch manage_node"
+pkill -f "ros2 run rover_odom_to_pose2d"
+sleep 1
+pkill -9 -f "nedo_test_ws/install"
+pkill -9 -f "ouster_ros/os_driver"
+pkill -9 -f "tf2_ros/static_transform_publisher"
+
+
+================================================
+■ 別PC 構成 (Ouster ドライバを別PC で動かす場合)
+================================================
+
+# === 別PC 側: ouster_ros インストール ===
+sudo apt update
+sudo apt install ros-humble-ouster-ros
+
+# またはソースビルド (メインPC とバージョンを揃える場合)
+mkdir -p ~/ouster_ws/src && cd ~/ouster_ws/src
+git clone -b humble https://github.com/ouster-lidar/ouster-ros.git
+cd ~/ouster_ws && colcon build --symlink-install
+
+# === メインPC → 別PC へファイル転送 ===
+# メインPC 側で実行:
+scp /home/rover/ouster_params.yaml user@<別PC>:~/
+scp /home/rover/nedo_test_ws/192.168.1-metadata.json user@<別PC>:~/
+
+# === 両PC の ~/.bashrc に共通設定 ===
+export ROS_DOMAIN_ID=30
+
+# === ネットワーク確認 ===
+# 同一サブネットであることを確認
+ip addr
+ping <相手PC>
+
+# ファイアウォールがある場合
+sudo ufw allow 7400:7500/udp
+
+# === 別PC 側: ouster driver 起動 ===
+source /opt/ros/humble/setup.bash
+# ソースビルドした場合: source ~/ouster_ws/install/setup.bash
+ros2 launch ouster_ros driver.launch.py params_file:=~/ouster_params.yaml viz:=false
+
+
+------------------------------------------------
+別PC 構成時にメインPC側の launch を修正
+------------------------------------------------
+
+# shuttle_system.launch.py の以下のブロックをコメントアウト or 削除:
+#
+#   ouster_launch = IncludeLaunchDescription(...)
+#
+# および return LaunchDescription([...]) の中の ouster_launch 行
+#
+# ouster_params_arg の DeclareLaunchArgument も不要になる
+
+
+================================================
+■ 確認コマンド
+================================================
+
+# トピック一覧
+ros2 topic list | grep -E "filtered_points|robot_pose2d|ouster|depth_clustering"
+
+# 主要トピックの出版レート
+ros2 topic hz /filtered_points          # ~10Hz
+ros2 topic hz /robot_pose2d             # ~100Hz
+ros2 topic hz /depth_clustering/segments  # ~10Hz
+ros2 topic hz /ouster/points            # ~10Hz (別PC でも Network経由で見える)
+
+# TF ツリー確認
+ros2 run tf2_ros tf2_echo odom base_link
+ros2 run tf2_ros tf2_echo odom os_gravity
+ros2 run tf2_tools view_frames
+
+# パラメータ確認
+ros2 param get /manage_node goals
+ros2 param get /manage_node obstacle_avoid_radius
+ros2 param get /manage_node robot_radius
+ros2 param get /manage_node path_band_half_width
+
+# ノード一覧
+ros2 node list
+
+
+

@@ -1,0 +1,1678 @@
+/**
+ * ============================================================================
+ * Iterative Seed Convergence Wavefront Ground Segmentation
+ * for Below Horizon LiDAR Point Clouds
+ * ============================================================================
+ * 
+ * Copyright (c) 2026 Yoshifumi Sasaki
+ * All rights reserved.
+ * 
+ * This software implements a novel ground removal algorithm for 3D LiDAR
+ * point clouds, specifically optimized for Below Horizon sensors.
+ * 
+ * ----------------------------------------------------------------------------
+ * ALGORITHM OVERVIEW
+ * ----------------------------------------------------------------------------
+ * 
+ * This method applies wavefront propagation (graph-based flood fill) to
+ * Range Images for ground segmentation. The key innovations are:
+ * 
+ * 1. ITERATIVE SEED CONVERGENCE
+ *    - Collects floor candidate points from bottom LiDAR beams
+ *    - Iteratively refines seed selection by minimizing Z-value variance
+ *    - Automatically excludes obstacle bottoms through statistical filtering
+ * 
+ * 2. WAVEFRONT PROPAGATION ON RANGE IMAGE
+ *    - Treats Range Image as a 2D graph with 4-connectivity
+ *    - Propagates from converged seeds using floor-specific transition rules:
+ *      * Height difference constraint
+ *      * Slope constraint  
+ *      * Range continuity constraint
+ *      * Local surface normal constraint
+ *    - Naturally stops at object/wall boundaries
+ * 
+ * 3. BELOW HORIZON OPTIMIZATION
+ *    - Exploits expected range geometry: range = sensor_height / |sin(v_angle)|
+ *    - Uses beam geometry for seed candidate filtering
+ * 
+ * ----------------------------------------------------------------------------
+ * REFERENCES
+ * ----------------------------------------------------------------------------
+ * 
+ * Range Image Segmentation:
+ *   [1] I. Bogoslavskyi and C. Stachniss,
+ *       "Fast Range Image-Based Segmentation of Sparse 3D Laser Scans
+ *       for Online Operation,"
+ *       IEEE/RSJ International Conference on Intelligent Robots and Systems
+ *       (IROS), 2016.
+ * 
+ * ----------------------------------------------------------------------------
+ * DEPENDENCIES
+ * ----------------------------------------------------------------------------
+ * 
+ * - ROS2 (Robot Operating System 2)
+ * - nlohmann/json (JSON parsing)
+ * - Ouster LiDAR driver (for sensor metadata and range image topics)
+ * 
+ * ============================================================================
+ */
+
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/point_field.hpp>
+#include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <std_msgs/msg/string.hpp>
+
+#include <deque>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <random>
+#include <chrono>
+#include <algorithm>
+#include <fstream>
+#include <array>
+#include <mutex>
+#include <nlohmann/json.hpp>
+
+// ============================================================================
+// Wavefront Ground Propagation
+// 波面伝播による床面検出
+// ============================================================================
+class WavefrontGroundRemoval
+{
+public:
+  struct Params {
+    double sensor_height = 0.385;
+    
+    // シード選定パラメータ
+    int seed_rows = 5;                    // 下位何行をシード候補とするか
+    double seed_range_tolerance = 0.5;    // 期待距離からの許容誤差[m]
+    
+    // シード収束パラメータ（新規）
+    double seed_convergence_threshold = 0.05;  // Z標準偏差の収束閾値[m]
+    int seed_max_iterations = 10;              // 最大反復回数
+    int seed_min_valid_rows = 3;               // 最低有効ビーム数
+    double seed_z_expand_threshold = 0.08;     // 収束後のシード拡張閾値[m]
+    
+    // 遷移判定パラメータ
+    double max_height_diff = 0.08;        // 隣接点間の最大高さ差[m]
+    double max_slope = 0.18;              // 最大傾斜 (tan(10°) ≈ 0.18)
+    double base_range_diff = 0.1;         // 基本の距離差許容値[m]
+    double range_diff_scale = 0.05;       // 距離に応じた許容値増加率
+    
+    // オプション: 期待距離チェック
+    bool use_expected_range_check = true;
+    double expected_range_tolerance = 1.0; // 期待距離からの許容誤差[m]
+    
+    // 法線チェックパラメータ
+    bool use_normal_check = true;
+    double min_normal_z = 0.85;           // 法線Z成分の最小値 (cos(30°) ≈ 0.866)
+
+    // IMU tilt補償
+    bool use_gravity_rotation = false;    // 重力軸への回転を有効化
+  };
+
+  WavefrontGroundRemoval() = default;
+  
+  explicit WavefrontGroundRemoval(const Params& params)
+    : params_(params) {}
+
+  void setParams(const Params& params) {
+    params_ = params;
+  }
+
+  // センサ座標系→重力座標系への回転行列を設定 (行優先 3x3)
+  void setGravityRotation(const std::array<double, 9>& R) {
+    R_sensor_to_gravity_ = R;
+  }
+
+  // Range Imageから地面を除去
+  void removeGround(
+    std::vector<float>& range_image,
+    std::vector<uint8_t>& ground_mask,
+    int rows, int cols,
+    const std::vector<double>& vertical_angles_rad
+  )
+  {
+    ground_mask.assign(range_image.size(), 0);
+    
+    // 訪問済みフラグ
+    std::vector<uint8_t> visited(range_image.size(), 0);
+    
+    // 3D座標キャッシュ
+    std::vector<Point3D> xyz_cache;
+    precomputeCoordinates(range_image, rows, cols, vertical_angles_rad, xyz_cache);
+    
+    // ================================================================
+    // Phase 1: 反復収束シード選定
+    // ================================================================
+    std::deque<std::pair<int, int>> wavefront;
+    int seed_count = 0;
+    
+    int start_row = rows - params_.seed_rows;
+    if (start_row < 0) start_row = 0;
+    
+    // Step 1: 各ビームの床候補を収集
+    struct SeedCandidate {
+      int row;
+      int col;
+      float z;
+      float range;
+      size_t idx;
+    };
+    
+    std::vector<std::vector<SeedCandidate>> candidates_per_row(params_.seed_rows);
+    
+    for (int ri = 0; ri < params_.seed_rows; ++ri) {
+      int r = start_row + ri;
+      if (r >= rows) break;
+      
+      double v_angle = vertical_angles_rad[r];
+      double sin_v = std::sin(v_angle);
+      double expected_range = 0.0;
+      if (std::abs(sin_v) > 0.01) {
+        expected_range = params_.sensor_height / std::abs(sin_v);
+      }
+      
+      for (int c = 0; c < cols; ++c) {
+        size_t idx = static_cast<size_t>(r) * cols + c;
+        float range = range_image[idx];
+        
+        if (range <= 0.0f) continue;
+        
+        float z = xyz_cache[idx].z;
+        float height = static_cast<float>(params_.sensor_height) + z;
+        
+        // 床候補条件:
+        // 1. 期待距離より遠い（確実に床か、床より遠い）
+        // 2. または、高さが地面付近（|height| < 0.1m）
+        bool is_candidate = false;
+        
+        if (expected_range > 0.0) {
+          // 期待距離より遠い、または非常に近い誤差範囲
+          if (range >= expected_range - 0.1) {
+            is_candidate = true;
+          }
+        }
+        
+        // 高さが地面付近
+        if (std::abs(height) < 0.15f) {
+          is_candidate = true;
+        }
+        
+        // 法線チェック
+        if (is_candidate && params_.use_normal_check) {
+          float normal_z = computeLocalNormalZ(r, c, range_image, xyz_cache, rows, cols);
+          if (normal_z < params_.min_normal_z) {
+            is_candidate = false;
+          }
+        }
+        
+        if (is_candidate) {
+          candidates_per_row[ri].push_back({r, c, z, range, idx});
+        }
+      }
+    }
+    
+    // Step 2: 各ビームから初期代表点を選択（最も期待距離に近い点）
+    std::vector<int> selected_indices(params_.seed_rows, -1);  // 各ビームの選択インデックス
+    
+    for (int ri = 0; ri < params_.seed_rows; ++ri) {
+      if (candidates_per_row[ri].empty()) continue;
+      
+      int r = start_row + ri;
+      double v_angle = vertical_angles_rad[r];
+      double sin_v = std::sin(v_angle);
+      double expected_range = (std::abs(sin_v) > 0.01) ? 
+        params_.sensor_height / std::abs(sin_v) : 0.0;
+      
+      // 期待距離に最も近い点を選択
+      int best_idx = 0;
+      double best_error = std::numeric_limits<double>::max();
+      for (size_t i = 0; i < candidates_per_row[ri].size(); ++i) {
+        double error = std::abs(candidates_per_row[ri][i].range - expected_range);
+        if (error < best_error) {
+          best_error = error;
+          best_idx = static_cast<int>(i);
+        }
+      }
+      selected_indices[ri] = best_idx;
+    }
+    
+    // Step 3: 反復収束
+    for (int iter = 0; iter < params_.seed_max_iterations; ++iter) {
+      // 有効な代表点のZ値を収集
+      std::vector<float> z_values;
+      std::vector<int> valid_rows;
+      
+      for (int ri = 0; ri < params_.seed_rows; ++ri) {
+        if (selected_indices[ri] >= 0 && 
+            selected_indices[ri] < static_cast<int>(candidates_per_row[ri].size())) {
+          z_values.push_back(candidates_per_row[ri][selected_indices[ri]].z);
+          valid_rows.push_back(ri);
+        }
+      }
+      
+      if (valid_rows.size() < static_cast<size_t>(params_.seed_min_valid_rows)) {
+        // 有効な点が少なすぎる → フォールバック
+        break;
+      }
+      
+      // 平均と標準偏差を計算
+      float mean_z = 0.0f;
+      for (float z : z_values) mean_z += z;
+      mean_z /= z_values.size();
+      
+      float var_z = 0.0f;
+      for (float z : z_values) var_z += (z - mean_z) * (z - mean_z);
+      float std_z = std::sqrt(var_z / z_values.size());
+      
+      // 収束判定
+      if (std_z < params_.seed_convergence_threshold) {
+        break;  // 収束
+      }
+      
+      // 最も外れている点を探す
+      int worst_valid_idx = -1;
+      float worst_deviation = 0.0f;
+      
+      for (size_t i = 0; i < valid_rows.size(); ++i) {
+        float deviation = z_values[i] - mean_z;  // 正 = 上に外れている
+        // 上方向の外れ値を優先的に除去
+        if (deviation > worst_deviation) {
+          worst_deviation = deviation;
+          worst_valid_idx = static_cast<int>(i);
+        }
+      }
+      
+      if (worst_valid_idx < 0 || worst_deviation < params_.seed_convergence_threshold) {
+        break;
+      }
+      
+      // 最外れ点を次の候補で置換
+      int ri = valid_rows[worst_valid_idx];
+      int current_idx = selected_indices[ri];
+      
+      // 次に良い候補を探す（mean_zに近い点）
+      int next_best_idx = -1;
+      float next_best_diff = std::numeric_limits<float>::max();
+      
+      for (size_t i = 0; i < candidates_per_row[ri].size(); ++i) {
+        if (static_cast<int>(i) == current_idx) continue;  // 現在の点はスキップ
+        
+        float diff = std::abs(candidates_per_row[ri][i].z - mean_z);
+        if (diff < next_best_diff) {
+          next_best_diff = diff;
+          next_best_idx = static_cast<int>(i);
+        }
+      }
+      
+      if (next_best_idx >= 0) {
+        selected_indices[ri] = next_best_idx;
+      } else {
+        // 代替候補がない → このビームを無効化
+        selected_indices[ri] = -1;
+      }
+    }
+    
+    // 収束した代表点のZ値を基準にシードを展開
+    // 有効な代表点からmean_zを再計算
+    float reference_z = 0.0f;
+    int valid_count = 0;
+    for (int ri = 0; ri < params_.seed_rows; ++ri) {
+      if (selected_indices[ri] >= 0 && 
+          selected_indices[ri] < static_cast<int>(candidates_per_row[ri].size())) {
+        reference_z += candidates_per_row[ri][selected_indices[ri]].z;
+        valid_count++;
+      }
+    }
+    
+    if (valid_count > 0) {
+      reference_z /= valid_count;
+    } else {
+      // フォールバック: 代表点がない場合、センサー高さを基準に
+      reference_z = -static_cast<float>(params_.sensor_height);  // 期待される床のZ
+    }
+    
+    // reference_zに近い点を全てシードとして追加
+    for (int ri = 0; ri < params_.seed_rows; ++ri) {
+      for (const auto& cand : candidates_per_row[ri]) {
+        if (std::abs(cand.z - reference_z) < params_.seed_z_expand_threshold) {
+          if (visited[cand.idx] == 0) {
+            ground_mask[cand.idx] = 1;
+            visited[cand.idx] = 1;
+            wavefront.push_back({cand.row, cand.col});
+            seed_count++;
+          }
+        }
+      }
+    }
+    
+    // フォールバック: シード数が少ない場合、期待距離に近い点を追加
+    if (seed_count < 100) {
+      for (int ri = 0; ri < params_.seed_rows; ++ri) {
+        int r = start_row + ri;
+        if (r >= rows) break;
+        
+        double v_angle = vertical_angles_rad[r];
+        double sin_v = std::sin(v_angle);
+        double expected_range = (std::abs(sin_v) > 0.01) ? 
+          params_.sensor_height / std::abs(sin_v) : 0.0;
+        
+        for (int c = 0; c < cols; ++c) {
+          size_t idx = static_cast<size_t>(r) * cols + c;
+          if (visited[idx]) continue;
+          
+          float range = range_image[idx];
+          if (range <= 0.0f) continue;
+          
+          // 期待距離に近い点
+          if (expected_range > 0.0 && 
+              std::abs(range - expected_range) < params_.seed_range_tolerance) {
+            ground_mask[idx] = 1;
+            visited[idx] = 1;
+            wavefront.push_back({r, c});
+            seed_count++;
+          }
+        }
+      }
+    }
+    
+    // ================================================================
+    // 波面伝播
+    // ================================================================
+    int propagation_count = 0;
+    
+    while (!wavefront.empty()) {
+      auto [r, c] = wavefront.front();
+      wavefront.pop_front();
+      
+      // 4近傍を検査
+      if (r > 0) {
+        tryPropagate(r, c, r - 1, c, range_image, ground_mask, visited,
+                     xyz_cache, vertical_angles_rad,
+                     rows, cols, wavefront, propagation_count);
+      }
+      if (r < rows - 1) {
+        tryPropagate(r, c, r + 1, c, range_image, ground_mask, visited,
+                     xyz_cache, vertical_angles_rad,
+                     rows, cols, wavefront, propagation_count);
+      }
+      {
+        int nc = (c - 1 + cols) % cols;
+        tryPropagate(r, c, r, nc, range_image, ground_mask, visited,
+                     xyz_cache, vertical_angles_rad,
+                     rows, cols, wavefront, propagation_count);
+      }
+      {
+        int nc = (c + 1) % cols;
+        tryPropagate(r, c, r, nc, range_image, ground_mask, visited,
+                     xyz_cache, vertical_angles_rad,
+                     rows, cols, wavefront, propagation_count);
+      }
+    }
+    
+    // ground_maskに基づいてrange_imageをゼロに
+    for (size_t i = 0; i < range_image.size(); ++i) {
+      if (ground_mask[i]) {
+        range_image[i] = 0.0f;
+      }
+    }
+    
+    // デバッグ出力
+    static bool first_frame = true;
+    if (first_frame) {
+      RCLCPP_INFO(rclcpp::get_logger("wavefront"), 
+        "Wavefront: reference_z=%.3f, seeds=%d, propagated=%d, total_ground=%d",
+        reference_z, seed_count, propagation_count, seed_count + propagation_count);
+      first_frame = false;
+    }
+  }
+
+private:
+  Params params_;
+
+  // センサ→重力座標系の回転行列 (行優先 3x3)
+  std::array<double, 9> R_sensor_to_gravity_ = {1.0, 0.0, 0.0,
+                                                 0.0, 1.0, 0.0,
+                                                 0.0, 0.0, 1.0};
+
+  // 3D座標を保持する構造体
+  struct Point3D {
+    float x, y, z;
+  };
+  
+  void precomputeCoordinates(
+    const std::vector<float>& range_image,
+    int rows, int cols,
+    const std::vector<double>& vertical_angles_rad,
+    std::vector<Point3D>& xyz_cache
+  )
+  {
+    xyz_cache.resize(range_image.size());
+
+    const bool rotate = params_.use_gravity_rotation;
+    const double m0 = R_sensor_to_gravity_[0], m1 = R_sensor_to_gravity_[1], m2 = R_sensor_to_gravity_[2];
+    const double m3 = R_sensor_to_gravity_[3], m4 = R_sensor_to_gravity_[4], m5 = R_sensor_to_gravity_[5];
+    const double m6 = R_sensor_to_gravity_[6], m7 = R_sensor_to_gravity_[7], m8 = R_sensor_to_gravity_[8];
+
+    for (int r = 0; r < rows; ++r) {
+      double v_angle = vertical_angles_rad[r];
+      double sin_v = std::sin(v_angle);
+      double cos_v = std::cos(v_angle);
+
+      for (int c = 0; c < cols; ++c) {
+        size_t idx = static_cast<size_t>(r) * cols + c;
+        float range = range_image[idx];
+
+        if (range > 0.0f) {
+          // 水平角度
+          double h_angle = (2.0 * M_PI * c / cols) - M_PI;
+          double cos_h = std::cos(h_angle);
+          double sin_h = std::sin(h_angle);
+
+          // センサ座標系での3D座標
+          double x = range * cos_v * cos_h;
+          double y = range * cos_v * sin_h;
+          double z = range * sin_v;
+
+          if (rotate) {
+            // 重力座標系へ回転: p_gravity = R * p_sensor
+            double xr = m0 * x + m1 * y + m2 * z;
+            double yr = m3 * x + m4 * y + m5 * z;
+            double zr = m6 * x + m7 * y + m8 * z;
+            xyz_cache[idx] = {static_cast<float>(xr), static_cast<float>(yr), static_cast<float>(zr)};
+          } else {
+            xyz_cache[idx] = {static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)};
+          }
+        } else {
+          xyz_cache[idx] = {0.0f, 0.0f, 0.0f};
+        }
+      }
+    }
+  }
+  
+  // 局所法線を計算（周囲4点から）
+  // 返り値: 法線のZ成分
+  float computeLocalNormalZ(
+    int r, int c,
+    const std::vector<float>& range_image,
+    const std::vector<Point3D>& xyz_cache,
+    int rows, int cols
+  )
+  {
+    size_t idx = static_cast<size_t>(r) * cols + c;
+    
+    // 中心点
+    if (range_image[idx] <= 0.0f) return 0.0f;
+    Point3D p_center = xyz_cache[idx];
+    
+    // 周囲の点を取得
+    Point3D p_up{}, p_down{}, p_left{}, p_right{};
+    bool has_up = false, has_down = false, has_left = false, has_right = false;
+    
+    // 上
+    if (r > 0) {
+      size_t idx_up = static_cast<size_t>(r - 1) * cols + c;
+      if (range_image[idx_up] > 0.0f) {
+        p_up = xyz_cache[idx_up];
+        has_up = true;
+      }
+    }
+
+    // 下
+    if (r < rows - 1) {
+      size_t idx_down = static_cast<size_t>(r + 1) * cols + c;
+      if (range_image[idx_down] > 0.0f) {
+        p_down = xyz_cache[idx_down];
+        has_down = true;
+      }
+    }
+    
+    // 左
+    {
+      int c_left = (c - 1 + cols) % cols;
+      size_t idx_left = static_cast<size_t>(r) * cols + c_left;
+      if (range_image[idx_left] > 0.0f) {
+        p_left = xyz_cache[idx_left];
+        has_left = true;
+      }
+    }
+    
+    // 右
+    {
+      int c_right = (c + 1) % cols;
+      size_t idx_right = static_cast<size_t>(r) * cols + c_right;
+      if (range_image[idx_right] > 0.0f) {
+        p_right = xyz_cache[idx_right];
+        has_right = true;
+      }
+    }
+    
+    // 2つのベクトルを計算して外積で法線を求める
+    float vx1, vy1, vz1;  // 水平方向ベクトル
+    float vx2, vy2, vz2;  // 垂直方向ベクトル
+    
+    // 水平方向ベクトル
+    if (has_left && has_right) {
+      vx1 = p_right.x - p_left.x;
+      vy1 = p_right.y - p_left.y;
+      vz1 = p_right.z - p_left.z;
+    } else if (has_right) {
+      vx1 = p_right.x - p_center.x;
+      vy1 = p_right.y - p_center.y;
+      vz1 = p_right.z - p_center.z;
+    } else if (has_left) {
+      vx1 = p_center.x - p_left.x;
+      vy1 = p_center.y - p_left.y;
+      vz1 = p_center.z - p_left.z;
+    } else {
+      return 1.0f;  // 水平方向の情報がない場合は床と仮定
+    }
+    
+    // 垂直方向ベクトル
+    if (has_up && has_down) {
+      vx2 = p_up.x - p_down.x;
+      vy2 = p_up.y - p_down.y;
+      vz2 = p_up.z - p_down.z;
+    } else if (has_up) {
+      vx2 = p_up.x - p_center.x;
+      vy2 = p_up.y - p_center.y;
+      vz2 = p_up.z - p_center.z;
+    } else if (has_down) {
+      vx2 = p_center.x - p_down.x;
+      vy2 = p_center.y - p_down.y;
+      vz2 = p_center.z - p_down.z;
+    } else {
+      return 1.0f;  // 垂直方向の情報がない場合は床と仮定
+    }
+    
+    // 外積: n = v1 × v2
+    float nx = vy1 * vz2 - vz1 * vy2;
+    float ny = vz1 * vx2 - vx1 * vz2;
+    float nz = vx1 * vy2 - vy1 * vx2;
+    
+    // 正規化
+    float norm = std::sqrt(nx * nx + ny * ny + nz * nz);
+    if (norm < 1e-6f) {
+      return 1.0f;  // 縮退している場合は床と仮定
+    }
+    
+    nz /= norm;
+    
+    // 法線が下向き（nz < 0）の場合は反転
+    return std::abs(nz);
+  }
+  
+  void tryPropagate(
+    int r1, int c1,    // 現在の点
+    int r2, int c2,    // 遷移先の点
+    const std::vector<float>& range_image,
+    std::vector<uint8_t>& ground_mask,
+    std::vector<uint8_t>& visited,
+    const std::vector<Point3D>& xyz_cache,
+    const std::vector<double>& vertical_angles_rad,
+    int rows, int cols,
+    std::deque<std::pair<int, int>>& wavefront,
+    int& propagation_count
+  )
+  {
+    size_t idx1 = static_cast<size_t>(r1) * cols + c1;
+    size_t idx2 = static_cast<size_t>(r2) * cols + c2;
+    
+    // 訪問済みならスキップ
+    if (visited[idx2]) return;
+    visited[idx2] = 1;
+    
+    float range1 = range_image[idx1];
+    float range2 = range_image[idx2];
+    
+    // 無効点はスキップ
+    if (range2 <= 0.0f) return;
+    
+    const Point3D& p1 = xyz_cache[idx1];
+    const Point3D& p2 = xyz_cache[idx2];
+    
+    float z1 = p1.z;
+    float z2 = p2.z;
+    float xy1 = std::sqrt(p1.x * p1.x + p1.y * p1.y);
+    float xy2 = std::sqrt(p2.x * p2.x + p2.y * p2.y);
+    
+    // 条件1: 高さ差が小さい
+    float height_diff = std::abs(z2 - z1);
+    if (height_diff > params_.max_height_diff) {
+      return;
+    }
+    
+    // 条件2: 傾斜が緩やか
+    float horizontal_dist;
+    if (r1 == r2) {
+      // 同じ行（水平方向の移動）
+      float dx = p2.x - p1.x;
+      float dy = p2.y - p1.y;
+      horizontal_dist = std::sqrt(dx * dx + dy * dy);
+    } else {
+      // 異なる行（前後方向の移動）
+      horizontal_dist = std::abs(xy2 - xy1);
+    }
+    
+    if (horizontal_dist > 0.01f) {
+      float slope = height_diff / horizontal_dist;
+      if (slope > params_.max_slope) {
+        return;
+      }
+    }
+    
+    // 条件3: 距離の連続性
+    float range_diff = std::abs(range2 - range1);
+    float allowed_diff = static_cast<float>(
+      params_.base_range_diff + range1 * params_.range_diff_scale
+    );
+    if (range_diff > allowed_diff) {
+      return;
+    }
+    
+    // 条件4: 期待距離との整合性
+    if (params_.use_expected_range_check) {
+      double v_angle = vertical_angles_rad[r2];
+      double sin_v = std::sin(v_angle);
+      if (std::abs(sin_v) > 0.01) {
+        double expected_range = params_.sensor_height / std::abs(sin_v);
+        double expected_error = std::abs(range2 - expected_range);
+        if (expected_error > params_.expected_range_tolerance) {
+          return;
+        }
+      }
+    }
+    
+    // 条件5: 絶対高さの制約
+    float absolute_height = params_.sensor_height + z2;
+    if (absolute_height > 0.3) {
+      return;
+    }
+    
+    // 条件6: 法線チェック
+    if (params_.use_normal_check) {
+      float normal_z = computeLocalNormalZ(r2, c2, range_image, xyz_cache, rows, cols);
+      if (normal_z < params_.min_normal_z) {
+        return;  // 法線が上向きでない → 壁や物体の可能性
+      }
+    }
+    
+    // すべての条件をパス → 床として追加
+    ground_mask[idx2] = 1;
+    wavefront.push_back({r2, c2});
+    propagation_count++;
+  }
+};
+
+// ============================================================================
+// Depth Clustering Node
+// ============================================================================
+class DepthClusteringNode : public rclcpp::Node
+{
+public:
+  DepthClusteringNode()
+  : Node("depth_clustering_node")
+  {
+    // Parameters - Sensor
+    declare_parameter<std::string>("metadata_path", "");
+    declare_parameter<bool>("use_metadata_file", false);
+    
+    // Parameters - Segmentation (Bogoslavskyi)
+    declare_parameter<double>("theta_deg", 10.0);
+    declare_parameter<int>("min_cluster_size", 10);
+    
+    // Parameters - Ground Removal (Wavefront)
+    declare_parameter<bool>("remove_ground", true);
+    declare_parameter<double>("sensor_height", 0.385);
+    declare_parameter<int>("seed_rows", 5);
+    declare_parameter<double>("seed_range_tolerance", 0.5);
+    declare_parameter<double>("seed_convergence_threshold", 0.05);
+    declare_parameter<int>("seed_max_iterations", 10);
+    declare_parameter<int>("seed_min_valid_rows", 3);
+    declare_parameter<double>("seed_z_expand_threshold", 0.08);
+    declare_parameter<double>("max_height_diff", 0.08);
+    declare_parameter<double>("max_slope", 0.18);
+    declare_parameter<double>("base_range_diff", 0.1);
+    declare_parameter<double>("range_diff_scale", 0.05);
+    declare_parameter<bool>("use_expected_range_check", true);
+    declare_parameter<double>("expected_range_tolerance", 1.0);
+    declare_parameter<bool>("use_normal_check", true);
+    declare_parameter<double>("min_normal_z", 0.85);
+
+    // Parameters - IMU tilt compensation
+    declare_parameter<bool>("use_imu_tilt_compensation", true);
+    
+    // Parameters - Cluster Filtering
+    declare_parameter<double>("min_z_extent", 0.05);  // 最小Z方向広がり[m]
+
+    // Get parameters
+    std::string metadata_path = get_parameter("metadata_path").as_string();
+    bool use_metadata_file = get_parameter("use_metadata_file").as_bool();
+    theta_deg_ = get_parameter("theta_deg").as_double();
+    theta_rad_ = deg2rad(theta_deg_);
+    min_cluster_size_ = get_parameter("min_cluster_size").as_int();
+    remove_ground_ = get_parameter("remove_ground").as_bool();
+    sensor_height_ = get_parameter("sensor_height").as_double();
+    
+    // Wavefront parameters
+    WavefrontGroundRemoval::Params wf_params;
+    wf_params.sensor_height = sensor_height_;
+    wf_params.seed_rows = get_parameter("seed_rows").as_int();
+    wf_params.seed_range_tolerance = get_parameter("seed_range_tolerance").as_double();
+    wf_params.seed_convergence_threshold = get_parameter("seed_convergence_threshold").as_double();
+    wf_params.seed_max_iterations = get_parameter("seed_max_iterations").as_int();
+    wf_params.seed_min_valid_rows = get_parameter("seed_min_valid_rows").as_int();
+    wf_params.seed_z_expand_threshold = get_parameter("seed_z_expand_threshold").as_double();
+    wf_params.max_height_diff = get_parameter("max_height_diff").as_double();
+    wf_params.max_slope = get_parameter("max_slope").as_double();
+    wf_params.base_range_diff = get_parameter("base_range_diff").as_double();
+    wf_params.range_diff_scale = get_parameter("range_diff_scale").as_double();
+    wf_params.use_expected_range_check = get_parameter("use_expected_range_check").as_bool();
+    wf_params.expected_range_tolerance = get_parameter("expected_range_tolerance").as_double();
+    wf_params.use_normal_check = get_parameter("use_normal_check").as_bool();
+    wf_params.min_normal_z = get_parameter("min_normal_z").as_double();
+
+    // IMU tilt compensation
+    use_imu_tilt_compensation_ = get_parameter("use_imu_tilt_compensation").as_bool();
+    if (use_imu_tilt_compensation_) {
+      wf_params.use_gravity_rotation = true;
+      // 期待距離チェックは sensor_frame v_angle に依存するため傾き補償時は無効化
+      wf_params.use_expected_range_check = false;
+    }
+
+    ground_remover_.setParams(wf_params);
+    wf_params_ = wf_params;
+    
+    // Cluster filtering parameter
+    min_z_extent_ = static_cast<float>(get_parameter("min_z_extent").as_double());
+
+    RCLCPP_INFO(get_logger(), "================================================");
+    RCLCPP_INFO(get_logger(), "Depth Clustering Node (Wavefront Ground Removal)");
+    RCLCPP_INFO(get_logger(), "================================================");
+
+    // Publishers
+    auto pub_qos = rclcpp::SensorDataQoS().keep_last(5);
+    seg_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+      "/depth_clustering/segments", pub_qos);
+    ground_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+      "/depth_clustering/ground", pub_qos);
+
+    metadata_received_ = false;
+
+    // Initialize transform to identity
+    for (int i = 0; i < 16; ++i) {
+      lidar_to_sensor_transform_[i] = (i % 5 == 0) ? 1.0 : 0.0;
+    }
+
+    // Load metadata
+    if (use_metadata_file) {
+      RCLCPP_INFO(get_logger(), "Loading metadata from file: %s", metadata_path.c_str());
+      if (loadMetadataFromFile(metadata_path)) {
+        initializeAfterMetadata();
+      } else {
+        RCLCPP_ERROR(get_logger(), "Failed to load metadata from file, will try topic...");
+        subscribeToMetadataTopic();
+      }
+    } else {
+      RCLCPP_INFO(get_logger(), "Waiting for metadata from /ouster/metadata topic...");
+      subscribeToMetadataTopic();
+    }
+  }
+
+private:
+  struct PointXYZRGB
+  {
+    float x;
+    float y;
+    float z;
+    float rgb;
+  };
+
+  static inline double deg2rad(double d) { return d * M_PI / 180.0; }
+  static inline double rad2deg(double r) { return r * 180.0 / M_PI; }
+
+  static inline float packRGB_u32_to_f32(uint32_t rgb_u32)
+  {
+    union U { uint32_t u; float f; };
+    U v;
+    v.u = rgb_u32;
+    return v.f;
+  }
+
+  static inline uint32_t rgb_u8(uint8_t r, uint8_t g, uint8_t b)
+  {
+    return (static_cast<uint32_t>(r) << 16) |
+           (static_cast<uint32_t>(g) << 8)  |
+           (static_cast<uint32_t>(b));
+  }
+
+  uint32_t labelToColorU32(int label) const
+  {
+    std::mt19937 rng(static_cast<uint32_t>(label));
+    std::uniform_int_distribution<int> dist(0, 255);
+    uint8_t r = static_cast<uint8_t>(dist(rng));
+    uint8_t g = static_cast<uint8_t>(dist(rng));
+    uint8_t b = static_cast<uint8_t>(dist(rng));
+    return rgb_u8(r, g, b);
+  }
+
+  void subscribeToMetadataTopic()
+  {
+    auto qos_reliable = rclcpp::QoS(rclcpp::KeepLast(1)).reliable();
+    metadata_sub_ = create_subscription<std_msgs::msg::String>(
+      "/ouster/metadata",
+      qos_reliable,
+      std::bind(&DepthClusteringNode::metadataCallback, this, std::placeholders::_1)
+    );
+  }
+
+  bool loadMetadataFromFile(const std::string& filepath)
+  {
+    try {
+      std::ifstream ifs(filepath);
+      if (!ifs.is_open()) {
+        RCLCPP_ERROR(get_logger(), "Failed to open metadata file: %s", filepath.c_str());
+        return false;
+      }
+
+      nlohmann::json metadata;
+      ifs >> metadata;
+
+      return parseMetadata(metadata);
+
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(get_logger(), "Exception loading metadata from file: %s", e.what());
+      return false;
+    }
+  }
+
+  bool parseMetadata(const nlohmann::json& metadata)
+  {
+    try {
+      // Extract beam information
+      nlohmann::json beam_angles;
+      nlohmann::json beam_azimuth_angles;
+      
+      if (metadata.contains("beam_intrinsics")) {
+        if (metadata["beam_intrinsics"].contains("beam_altitude_angles")) {
+          beam_angles = metadata["beam_intrinsics"]["beam_altitude_angles"];
+        }
+        if (metadata["beam_intrinsics"].contains("beam_azimuth_angles")) {
+          beam_azimuth_angles = metadata["beam_intrinsics"]["beam_azimuth_angles"];
+        }
+        if (metadata["beam_intrinsics"].contains("lidar_origin_to_beam_origin_mm")) {
+          lidar_origin_to_beam_origin_mm_ = 
+            metadata["beam_intrinsics"]["lidar_origin_to_beam_origin_mm"].get<double>();
+        }
+      }
+      
+      if (beam_angles.empty() && metadata.contains("beam_altitude_angles")) {
+        beam_angles = metadata["beam_altitude_angles"];
+      }
+      if (beam_azimuth_angles.empty() && metadata.contains("beam_azimuth_angles")) {
+        beam_azimuth_angles = metadata["beam_azimuth_angles"];
+      }
+
+      if (beam_angles.empty()) {
+        RCLCPP_ERROR(get_logger(), "Could not find beam_altitude_angles in metadata");
+        return false;
+      }
+
+      beam_num_ = static_cast<int>(beam_angles.size());
+
+      // Extract lidar mode
+      std::string lidar_mode;
+      if (metadata.contains("config_params") && 
+          metadata["config_params"].contains("lidar_mode")) {
+        lidar_mode = metadata["config_params"]["lidar_mode"];
+      } else if (metadata.contains("lidar_mode")) {
+        lidar_mode = metadata["lidar_mode"];
+      } else {
+        RCLCPP_ERROR(get_logger(), "Could not find lidar_mode in metadata");
+        return false;
+      }
+
+      size_t x_pos = lidar_mode.find('x');
+      if (x_pos != std::string::npos) {
+        h_res_ = std::stoi(lidar_mode.substr(0, x_pos));
+      } else {
+        RCLCPP_ERROR(get_logger(), "Invalid lidar_mode format: %s", lidar_mode.c_str());
+        return false;
+      }
+
+      // Load vertical angles
+      vertical_angles_rad_.resize(beam_num_);
+      for (int i = 0; i < beam_num_; ++i) {
+        vertical_angles_rad_[i] = deg2rad(beam_angles[i].get<double>());
+      }
+
+      // Load azimuth angles
+      azimuth_angles_rad_.resize(beam_num_);
+      if (!beam_azimuth_angles.empty()) {
+        for (int i = 0; i < beam_num_; ++i) {
+          azimuth_angles_rad_[i] = deg2rad(beam_azimuth_angles[i].get<double>());
+        }
+      } else {
+        std::fill(azimuth_angles_rad_.begin(), azimuth_angles_rad_.end(), 0.0);
+      }
+
+      // Load pixel shift
+      if (metadata.contains("lidar_data_format") && 
+          metadata["lidar_data_format"].contains("pixel_shift_by_row")) {
+        auto pixel_shifts = metadata["lidar_data_format"]["pixel_shift_by_row"];
+        pixel_shift_by_row_.resize(beam_num_);
+        for (int i = 0; i < beam_num_; ++i) {
+          pixel_shift_by_row_[i] = pixel_shifts[i].get<int>();
+        }
+      } else {
+        pixel_shift_by_row_.assign(beam_num_, 0);
+      }
+
+      // Load lidar_to_sensor_transform
+      if (metadata.contains("lidar_intrinsics") && 
+          metadata["lidar_intrinsics"].contains("lidar_to_sensor_transform")) {
+        auto transform = metadata["lidar_intrinsics"]["lidar_to_sensor_transform"];
+        for (int i = 0; i < 16 && i < static_cast<int>(transform.size()); ++i) {
+          lidar_to_sensor_transform_[i] = transform[i].get<double>();
+        }
+      }
+
+      // Calculate parameters
+      double v_fov_deg = 0.0;
+      if (beam_num_ > 1) {
+        double min_angle = vertical_angles_rad_[0];
+        double max_angle = vertical_angles_rad_[0];
+        for (double angle : vertical_angles_rad_) {
+          min_angle = std::min(min_angle, angle);
+          max_angle = std::max(max_angle, angle);
+        }
+        v_fov_deg = rad2deg(max_angle - min_angle);
+      }
+
+      alpha_h_ = deg2rad(360.0 / h_res_);
+      
+      double sum_diff = 0.0;
+      for (size_t i = 1; i < vertical_angles_rad_.size(); ++i) {
+        sum_diff += std::abs(vertical_angles_rad_[i] - vertical_angles_rad_[i-1]);
+      }
+      alpha_v_ = sum_diff / (vertical_angles_rad_.size() - 1);
+
+      // Log configuration
+      RCLCPP_INFO(get_logger(), "================================================================");
+      RCLCPP_INFO(get_logger(), "Sensor Configuration:");
+      
+      std::string prod_line = "Unknown";
+      if (metadata.contains("sensor_info") && metadata["sensor_info"].contains("prod_line")) {
+        prod_line = metadata["sensor_info"]["prod_line"].get<std::string>();
+      }
+      
+      RCLCPP_INFO(get_logger(), "  Product: %s", prod_line.c_str());
+      RCLCPP_INFO(get_logger(), "  Beams: %d, H-resolution: %d", beam_num_, h_res_);
+      RCLCPP_INFO(get_logger(), "  V-FOV: %.2f deg (%.2f to %.2f deg)",
+                  v_fov_deg,
+                  rad2deg(vertical_angles_rad_.front()),
+                  rad2deg(vertical_angles_rad_.back()));
+      RCLCPP_INFO(get_logger(), "Segmentation Parameters (Bogoslavskyi):");
+      RCLCPP_INFO(get_logger(), "  Theta: %.2f deg, Min cluster: %d", theta_deg_, min_cluster_size_);
+      RCLCPP_INFO(get_logger(), "  Min Z-extent: %.3f m (flat clusters removed)", min_z_extent_);
+      RCLCPP_INFO(get_logger(), "Ground Removal (Wavefront Propagation):");
+      RCLCPP_INFO(get_logger(), "  Enabled: %s", remove_ground_ ? "true" : "false");
+      RCLCPP_INFO(get_logger(), "  Sensor height: %.3f m", sensor_height_);
+      RCLCPP_INFO(get_logger(), "  Seed selection:");
+      RCLCPP_INFO(get_logger(), "    Rows: %d, Convergence threshold: %.3f m", 
+                  wf_params_.seed_rows, wf_params_.seed_convergence_threshold);
+      RCLCPP_INFO(get_logger(), "    Max iterations: %d, Min valid rows: %d",
+                  wf_params_.seed_max_iterations, wf_params_.seed_min_valid_rows);
+      RCLCPP_INFO(get_logger(), "    Z expand threshold: %.3f m", wf_params_.seed_z_expand_threshold);
+      RCLCPP_INFO(get_logger(), "  Propagation:");
+      RCLCPP_INFO(get_logger(), "    Max height diff: %.3f m", wf_params_.max_height_diff);
+      RCLCPP_INFO(get_logger(), "    Max slope: %.2f (%.1f deg)", wf_params_.max_slope, rad2deg(std::atan(wf_params_.max_slope)));
+      RCLCPP_INFO(get_logger(), "    Expected range check: %s", wf_params_.use_expected_range_check ? "ON" : "OFF");
+      RCLCPP_INFO(get_logger(), "    Normal check: %s (min_z=%.2f, max_angle=%.1f deg)", 
+                  wf_params_.use_normal_check ? "ON" : "OFF",
+                  wf_params_.min_normal_z,
+                  rad2deg(std::acos(wf_params_.min_normal_z)));
+      RCLCPP_INFO(get_logger(), "================================================================");
+
+      metadata_received_ = true;
+      return true;
+
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(get_logger(), "Failed to parse metadata: %s", e.what());
+      return false;
+    }
+  }
+
+  void initializeAfterMetadata()
+  {
+    auto qos_best_effort = rclcpp::SensorDataQoS();
+    range_image_sub_ = create_subscription<sensor_msgs::msg::Image>(
+      "/ouster/range_image",
+      qos_best_effort,
+      std::bind(&DepthClusteringNode::rangeImageCallback, this, std::placeholders::_1)
+    );
+
+    if (use_imu_tilt_compensation_) {
+      imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+        "/ouster/imu",
+        qos_best_effort,
+        std::bind(&DepthClusteringNode::imuCallback, this, std::placeholders::_1)
+      );
+      RCLCPP_INFO(get_logger(), "IMU tilt compensation: subscribing to /ouster/imu");
+    } else {
+      RCLCPP_INFO(get_logger(), "IMU tilt compensation: disabled");
+    }
+
+    RCLCPP_INFO(get_logger(), "Node fully initialized! Processing range images...");
+  }
+
+  void metadataCallback(const std_msgs::msg::String::SharedPtr msg)
+  {
+    if (metadata_received_) return;
+
+    try {
+      nlohmann::json metadata = nlohmann::json::parse(msg->data);
+      if (parseMetadata(metadata)) {
+        initializeAfterMetadata();
+      }
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(get_logger(), "Failed to parse metadata from topic: %s", e.what());
+    }
+  }
+
+  bool imageMsgToRangeImage(
+    const sensor_msgs::msg::Image & msg,
+    std::vector<float> & range_image_out
+  )
+  {
+    if (msg.encoding != "mono16") {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
+        "Unsupported encoding: %s", msg.encoding.c_str());
+      return false;
+    }
+
+    if (static_cast<int>(msg.height) != beam_num_ ||
+        static_cast<int>(msg.width)  != h_res_) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
+        "Size mismatch: got %ux%u, expected %dx%d",
+        msg.height, msg.width, beam_num_, h_res_);
+      return false;
+    }
+
+    const size_t N = static_cast<size_t>(beam_num_) * static_cast<size_t>(h_res_);
+    range_image_out.assign(N, 0.0f);
+
+    const uint16_t* src = reinterpret_cast<const uint16_t*>(msg.data.data());
+
+    for (size_t i = 0; i < N; ++i) {
+      const uint16_t d_raw = src[i];
+      if (d_raw > 0) {
+        // Ouster range_image: 4mm scale factor
+        range_image_out[i] = static_cast<float>(d_raw) * 0.004f;
+      }
+    }
+
+    return true;
+  }
+
+  // LiDAR座標系での点を計算
+  void rangeImageToLidarXYZ(int row, int col, float range, 
+                            double& x_lidar, double& y_lidar, double& z_lidar) const
+  {
+    const double v_angle = vertical_angles_rad_[row];
+    const double azimuth_offset = azimuth_angles_rad_[row];
+    const int pixel_shift = pixel_shift_by_row_[row];
+    
+    const int col_destaggered = (col - pixel_shift + h_res_) % h_res_;
+    const double encoder_angle = 2.0 * M_PI * static_cast<double>(col_destaggered) / static_cast<double>(h_res_);
+    const double total_h_angle = encoder_angle + azimuth_offset;
+    
+    const double cos_v = std::cos(v_angle);
+    const double sin_v = std::sin(v_angle);
+    const double cos_h = std::cos(total_h_angle);
+    const double sin_h = std::sin(total_h_angle);
+    
+    const double r = static_cast<double>(range);
+    const double beam_offset = lidar_origin_to_beam_origin_mm_ * 0.001;
+    
+    x_lidar = (r + beam_offset) * cos_v * cos_h - beam_offset * cos_h;
+    y_lidar = (r + beam_offset) * cos_v * sin_h - beam_offset * sin_h;
+    z_lidar = (r + beam_offset) * sin_v;
+  }
+
+  // LiDAR座標系 -> センサ座標系 (メタデータの lidar_to_sensor_transform を正適用)
+  // 行優先4x4。回転成分は無次元、並進成分は mm 単位で格納されているため *0.001 で m に変換。
+  void applyLidarToSensorTransform(double x_lidar, double y_lidar, double z_lidar,
+                                    float& x_sensor, float& y_sensor, float& z_sensor) const
+  {
+    const double tx = lidar_to_sensor_transform_[3]  * 0.001;
+    const double ty = lidar_to_sensor_transform_[7]  * 0.001;
+    const double tz = lidar_to_sensor_transform_[11] * 0.001;
+
+    x_sensor = static_cast<float>(
+      lidar_to_sensor_transform_[0] * x_lidar +
+      lidar_to_sensor_transform_[1] * y_lidar +
+      lidar_to_sensor_transform_[2] * z_lidar + tx);
+
+    y_sensor = static_cast<float>(
+      lidar_to_sensor_transform_[4] * x_lidar +
+      lidar_to_sensor_transform_[5] * y_lidar +
+      lidar_to_sensor_transform_[6] * z_lidar + ty);
+
+    z_sensor = static_cast<float>(
+      lidar_to_sensor_transform_[8]  * x_lidar +
+      lidar_to_sensor_transform_[9]  * y_lidar +
+      lidar_to_sensor_transform_[10] * z_lidar + tz);
+  }
+
+  void rangeImageToSensorXYZ(int row, int col, float range,
+                              float& x, float& y, float& z) const
+  {
+    double x_lidar, y_lidar, z_lidar;
+    rangeImageToLidarXYZ(row, col, range, x_lidar, y_lidar, z_lidar);
+    applyLidarToSensorTransform(x_lidar, y_lidar, z_lidar, x, y, z);
+  }
+
+  inline bool shouldConnect(
+    const std::vector<float> & range_image,
+    int r1, int c1,
+    int r2, int c2,
+    double alpha
+  ) const
+  {
+    const float d1 = range_image[static_cast<size_t>(r1) * h_res_ + static_cast<size_t>(c1)];
+    const float d2 = range_image[static_cast<size_t>(r2) * h_res_ + static_cast<size_t>(c2)];
+
+    if (!(d1 > 0.0f) || !(d2 > 0.0f)) return false;
+
+    const double d_max = std::max<double>(d1, d2);
+    const double d_min = std::min<double>(d1, d2);
+
+    const double numerator = d_min * std::sin(alpha);
+    const double denominator = d_max - d_min * std::cos(alpha);
+
+    if (denominator <= 1e-6) return false;
+
+    const double beta = std::atan(numerator / denominator);
+    return beta > theta_rad_;
+  }
+
+  void labelComponentBFS(
+    const std::vector<float> & range_image,
+    std::vector<int> & labels,
+    int start_r, int start_c,
+    int label
+  )
+  {
+    std::deque<int> q;
+    q.push_back(start_r * h_res_ + start_c);
+
+    while (!q.empty()) {
+      const int idx = q.front();
+      q.pop_front();
+
+      if (labels[static_cast<size_t>(idx)] != 0) continue;
+      labels[static_cast<size_t>(idx)] = label;
+
+      const int r = idx / h_res_;
+      const int c = idx % h_res_;
+
+      // N4 neighbors
+      if (r > 0) {
+        const int nr = r - 1, nc = c;
+        const int nidx = nr * h_res_ + nc;
+        if (labels[static_cast<size_t>(nidx)] == 0) {
+          const float dv = range_image[static_cast<size_t>(nidx)];
+          if (dv > 0.0f && shouldConnect(range_image, r, c, nr, nc, alpha_v_)) 
+            q.push_back(nidx);
+        }
+      }
+      if (r < beam_num_ - 1) {
+        const int nr = r + 1, nc = c;
+        const int nidx = nr * h_res_ + nc;
+        if (labels[static_cast<size_t>(nidx)] == 0) {
+          const float dv = range_image[static_cast<size_t>(nidx)];
+          if (dv > 0.0f && shouldConnect(range_image, r, c, nr, nc, alpha_v_)) 
+            q.push_back(nidx);
+        }
+      }
+      {
+        const int nr = r;
+        const int nc = (c - 1 + h_res_) % h_res_;
+        const int nidx = nr * h_res_ + nc;
+        if (labels[static_cast<size_t>(nidx)] == 0) {
+          const float dv = range_image[static_cast<size_t>(nidx)];
+          if (dv > 0.0f && shouldConnect(range_image, r, c, nr, nc, alpha_h_)) 
+            q.push_back(nidx);
+        }
+      }
+      {
+        const int nr = r;
+        const int nc = (c + 1) % h_res_;
+        const int nidx = nr * h_res_ + nc;
+        if (labels[static_cast<size_t>(nidx)] == 0) {
+          const float dv = range_image[static_cast<size_t>(nidx)];
+          if (dv > 0.0f && shouldConnect(range_image, r, c, nr, nc, alpha_h_)) 
+            q.push_back(nidx);
+        }
+      }
+    }
+  }
+
+  void segmentRangeImage(
+    const std::vector<float> & range_image,
+    std::vector<int> & labels_out
+  )
+  {
+    labels_out.assign(range_image.size(), 0);
+    int current_label = 1;
+
+    for (int r = 0; r < beam_num_; ++r) {
+      const size_t row_base = static_cast<size_t>(r) * static_cast<size_t>(h_res_);
+      for (int c = 0; c < h_res_; ++c) {
+        const size_t idx = row_base + static_cast<size_t>(c);
+        if (labels_out[idx] == 0 && range_image[idx] > 0.0f) {
+          labelComponentBFS(range_image, labels_out, r, c, current_label);
+          ++current_label;
+        }
+      }
+    }
+  }
+
+  // クラスタのZ方向の広がりを計算するための構造体
+  struct ClusterStats {
+    int count = 0;
+    float z_min = std::numeric_limits<float>::max();
+    float z_max = std::numeric_limits<float>::lowest();
+  };
+
+  void filterClusters(
+    std::vector<int>& labels_io,
+    const std::vector<float>& range_image,
+    int min_size,
+    float min_z_extent
+  )
+  {
+    // 各クラスタの統計を収集
+    std::unordered_map<int, ClusterStats> cluster_stats;
+    cluster_stats.reserve(1024);
+
+    for (int r = 0; r < beam_num_; ++r) {
+      double v_angle = vertical_angles_rad_[r];
+      double sin_v = std::sin(v_angle);
+      
+      for (int c = 0; c < h_res_; ++c) {
+        size_t idx = static_cast<size_t>(r) * h_res_ + c;
+        int lab = labels_io[idx];
+        
+        if (lab > 0) {
+          float range = range_image[idx];
+          if (range > 0.0f) {
+            float z = static_cast<float>(range * sin_v);
+            
+            auto& stats = cluster_stats[lab];
+            stats.count++;
+            stats.z_min = std::min(stats.z_min, z);
+            stats.z_max = std::max(stats.z_max, z);
+          }
+        }
+      }
+    }
+
+    // フィルタリング: サイズまたはZ-extentが閾値以下のクラスタを除去
+    for (int& lab : labels_io) {
+      if (lab > 0) {
+        auto it = cluster_stats.find(lab);
+        if (it != cluster_stats.end()) {
+          const auto& stats = it->second;
+          float z_extent = stats.z_max - stats.z_min;
+          
+          // 除去条件:
+          // 1. 点数が少なすぎる
+          // 2. Z方向の広がりが小さすぎる（床の残りと判断）
+          if (stats.count < min_size || z_extent < min_z_extent) {
+            lab = 0;
+          }
+        }
+      }
+    }
+  }
+
+  // 後方互換性のため元の関数も残す
+  void filterSmallClusters(std::vector<int> & labels_io, int min_size)
+  {
+    std::unordered_map<int, int> counts;
+    counts.reserve(1024);
+
+    for (int lab : labels_io) {
+      if (lab > 0) counts[lab] += 1;
+    }
+    for (int & lab : labels_io) {
+      if (lab > 0) {
+        auto it = counts.find(lab);
+        if (it != counts.end() && it->second < min_size) lab = 0;
+      }
+    }
+  }
+
+  void publishCloud(
+    const std::vector<PointXYZRGB> & pts,
+    const std_msgs::msg::Header & header,
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr & pub
+  )
+  {
+    if (pts.empty()) return;
+
+    sensor_msgs::msg::PointCloud2 out;
+    out.header = header;
+    out.height = 1;
+    out.width = static_cast<uint32_t>(pts.size());
+    out.is_bigendian = false;
+    out.is_dense = true;
+
+    out.fields.resize(4);
+    out.fields[0].name = "x";
+    out.fields[0].offset = 0;
+    out.fields[0].datatype = sensor_msgs::msg::PointField::FLOAT32;
+    out.fields[0].count = 1;
+
+    out.fields[1].name = "y";
+    out.fields[1].offset = 4;
+    out.fields[1].datatype = sensor_msgs::msg::PointField::FLOAT32;
+    out.fields[1].count = 1;
+
+    out.fields[2].name = "z";
+    out.fields[2].offset = 8;
+    out.fields[2].datatype = sensor_msgs::msg::PointField::FLOAT32;
+    out.fields[2].count = 1;
+
+    out.fields[3].name = "rgb";
+    out.fields[3].offset = 12;
+    out.fields[3].datatype = sensor_msgs::msg::PointField::FLOAT32;
+    out.fields[3].count = 1;
+
+    out.point_step = sizeof(PointXYZRGB);
+    out.row_step = out.point_step * out.width;
+
+    out.data.resize(static_cast<size_t>(out.row_step));
+    std::memcpy(out.data.data(), pts.data(), out.data.size());
+
+    pub->publish(out);
+  }
+
+  void publishSegments(
+    const std::vector<float> & range_image,
+    const std::vector<int> & labels,
+    const std_msgs::msg::Header & header
+  )
+  {
+    std::vector<PointXYZRGB> pts;
+    pts.reserve(20000);
+
+    for (int r = 0; r < beam_num_; ++r) {
+      const size_t row_base = static_cast<size_t>(r) * static_cast<size_t>(h_res_);
+      for (int c = 0; c < h_res_; ++c) {
+        const size_t idx = row_base + static_cast<size_t>(c);
+        const int lab = labels[idx];
+        if (lab <= 0) continue;
+
+        const float d = range_image[idx];
+        if (!(d > 0.0f)) continue;
+
+        float x, y, z;
+        rangeImageToSensorXYZ(r, c, d, x, y, z);
+
+        const uint32_t rgb_u32 = labelToColorU32(lab);
+        const float rgb_f32 = packRGB_u32_to_f32(rgb_u32);
+
+        pts.push_back(PointXYZRGB{x, y, z, rgb_f32});
+      }
+    }
+    publishCloud(pts, header, seg_pub_);
+  }
+
+  void publishGround(
+    const std::vector<float> & range_image_original,
+    const std::vector<uint8_t> & ground_mask,
+    const std_msgs::msg::Header & header
+  )
+  {
+    std::vector<PointXYZRGB> pts;
+    pts.reserve(10000);
+
+    const uint32_t green_u32 = rgb_u8(0, 255, 0);
+    const float green_f32 = packRGB_u32_to_f32(green_u32);
+
+    for (int r = 0; r < beam_num_; ++r) {
+      const size_t row_base = static_cast<size_t>(r) * static_cast<size_t>(h_res_);
+      for (int c = 0; c < h_res_; ++c) {
+        const size_t idx = row_base + static_cast<size_t>(c);
+        if (ground_mask[idx] == 0) continue;
+
+        const float d = range_image_original[idx];
+        if (!(d > 0.0f)) continue;
+
+        float x, y, z;
+        rangeImageToSensorXYZ(r, c, d, x, y, z);
+
+        pts.push_back(PointXYZRGB{x, y, z, green_f32});
+      }
+    }
+
+    publishCloud(pts, header, ground_pub_);
+  }
+
+  void imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg)
+  {
+    // 静止時の linear_acceleration は specific force = -gravity (sensor frame)
+    // センサが直立なら (0, 0, +g) に、「上」方向を示す
+    double ax = msg->linear_acceleration.x;
+    double ay = msg->linear_acceleration.y;
+    double az = msg->linear_acceleration.z;
+
+    double norm = std::sqrt(ax * ax + ay * ay + az * az);
+    // 物理的にあり得ない値は無視 (重力の 0.5x 未満, 1.5x 超過)
+    if (norm < 5.0 || norm > 15.0) return;
+
+    double nx = ax / norm;
+    double ny = ay / norm;
+    double nz = az / norm;
+
+    {
+      std::lock_guard<std::mutex> lock(gravity_mutex_);
+      if (!imu_initialized_) {
+        g_ema_x_ = nx;
+        g_ema_y_ = ny;
+        g_ema_z_ = nz;
+        imu_initialized_ = true;
+      } else {
+        // EMA ローパスフィルタ (alpha=0.05 ≒ 100Hz IMU で時定約 0.2s)
+        g_ema_x_ = 0.05 * nx + 0.95 * g_ema_x_;
+        g_ema_y_ = 0.05 * ny + 0.95 * g_ema_y_;
+        g_ema_z_ = 0.05 * nz + 0.95 * g_ema_z_;
+      }
+
+      double fx = g_ema_x_, fy = g_ema_y_, fz = g_ema_z_;
+      double fnorm = std::sqrt(fx * fx + fy * fy + fz * fz);
+      if (fnorm > 1e-6) {
+        fx /= fnorm; fy /= fnorm; fz /= fnorm;
+      }
+      computeGravityRotation(fx, fy, fz);
+    }
+  }
+
+  // 最短弧回転行列 R を計算 (R * (nx,ny,nz) = (0,0,1))
+  // 予め導出済みの閉形式:
+  //   R = | 1-nx²/(1+nz)    -nx*ny/(1+nz)   -nx |
+  //       | -nx*ny/(1+nz)   1-ny²/(1+nz)    -ny |
+  //       | nx              ny               nz  |
+  // gravity_mutex_ 配下で呼ばれる前提
+  void computeGravityRotation(double nx, double ny, double nz)
+  {
+    std::array<double, 9> R;
+
+    if (nx * nx + ny * ny < 1e-6) {
+      // センサほぼ直立または逆さ
+      if (nz > 0) {
+        R = {1.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.0, 0.0, 1.0};
+      } else {
+        // 逆さ: X軸周り 180°
+        R = {1.0, 0.0, 0.0,  0.0, -1.0, 0.0,  0.0, 0.0, -1.0};
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "Sensor appears upside down; tilt compensation unreliable.");
+      }
+    } else {
+      double denom = 1.0 + nz;
+      R[0] = 1.0 - nx * nx / denom;
+      R[1] = -nx * ny / denom;
+      R[2] = -nx;
+      R[3] = -nx * ny / denom;
+      R[4] = 1.0 - ny * ny / denom;
+      R[5] = -ny;
+      R[6] = nx;
+      R[7] = ny;
+      R[8] = nz;
+    }
+
+    R_sensor_to_gravity_ = R;
+  }
+
+  void rangeImageCallback(const sensor_msgs::msg::Image::SharedPtr msg)
+  {
+    if (!metadata_received_) return;
+
+    const auto t_start = std::chrono::steady_clock::now();
+
+    // 1) Convert
+    std::vector<float> range_image;
+    if (!imageMsgToRangeImage(*msg, range_image)) {
+      return;
+    }
+
+    std::vector<float> range_image_original = range_image;
+    int num_input_points = 0;
+    for (float v : range_image_original) {
+      if (v > 0.0f) ++num_input_points;
+    }
+
+    // 2) Ground removal (Wavefront)
+    const auto t2 = std::chrono::steady_clock::now();
+    std::vector<uint8_t> ground_mask;
+    if (remove_ground_) {
+      if (use_imu_tilt_compensation_) {
+        std::lock_guard<std::mutex> lock(gravity_mutex_);
+        ground_remover_.setGravityRotation(R_sensor_to_gravity_);
+      }
+      ground_remover_.removeGround(range_image, ground_mask,
+                                    beam_num_, h_res_, vertical_angles_rad_);
+    } else {
+      ground_mask.assign(range_image.size(), 0);
+    }
+    const auto t3 = std::chrono::steady_clock::now();
+
+    int num_after_ground = 0;
+    int num_ground = 0;
+    for (size_t i = 0; i < range_image.size(); ++i) {
+      if (range_image[i] > 0.0f) ++num_after_ground;
+      if (ground_mask[i]) ++num_ground;
+    }
+
+    // 3) Segmentation
+    const auto t4 = std::chrono::steady_clock::now();
+    std::vector<int> labels;
+    segmentRangeImage(range_image, labels);
+    const auto t5 = std::chrono::steady_clock::now();
+
+    // 4) Filter (サイズとZ-extent両方でフィルタリング)
+    filterClusters(labels, range_image, min_cluster_size_, min_z_extent_);
+
+    std::unordered_map<int, int> cluster_seen;
+    for (int lab : labels) {
+      if (lab > 0) cluster_seen.emplace(lab, 1);
+    }
+    const int num_clusters = static_cast<int>(cluster_seen.size());
+
+    // 5) Publish
+    publishSegments(range_image, labels, msg->header);
+    publishGround(range_image_original, ground_mask, msg->header);
+    const auto t9 = std::chrono::steady_clock::now();
+
+    const auto ms = [](auto a, auto b) {
+      return std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(b - a).count();
+    };
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "Total: %.0fms | Ground: %.1fms | Seg: %.0fms | Points: %d->%d | Ground: %d (%.1f%%) | Clusters: %d | Rate: %.1fHz",
+      ms(t_start, t9),
+      ms(t2, t3),
+      ms(t4, t5),
+      num_input_points,
+      num_after_ground,
+      num_ground,
+      100.0 * num_ground / std::max(num_input_points, 1),
+      num_clusters,
+      1000.0 / ms(t_start, t9)
+    );
+  }
+
+private:
+  // ROS
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr metadata_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr range_image_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr seg_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr ground_pub_;
+
+  bool metadata_received_;
+
+  // IMU tilt compensation
+  bool use_imu_tilt_compensation_{true};
+  std::mutex gravity_mutex_;
+  bool imu_initialized_{false};
+  double g_ema_x_{0.0}, g_ema_y_{0.0}, g_ema_z_{0.0};
+  std::array<double, 9> R_sensor_to_gravity_{1.0, 0.0, 0.0,
+                                              0.0, 1.0, 0.0,
+                                              0.0, 0.0, 1.0};
+
+  // Params
+  int beam_num_{32};
+  int h_res_{1024};
+  double theta_deg_{10.0};
+  double theta_rad_{0.0};
+  int min_cluster_size_{10};
+  bool remove_ground_{true};
+  double sensor_height_{0.807};
+  float min_z_extent_{0.05f};  // 最小Z方向広がり[m]
+
+  // Angles and calibration
+  double alpha_v_{0.0};
+  double alpha_h_{0.0};
+  std::vector<double> vertical_angles_rad_;
+  std::vector<double> azimuth_angles_rad_;
+  std::vector<int> pixel_shift_by_row_;
+  
+  // Transforms
+  std::array<double, 16> lidar_to_sensor_transform_;
+  double lidar_origin_to_beam_origin_mm_{0.0};
+  
+  // Ground removal
+  WavefrontGroundRemoval ground_remover_;
+  WavefrontGroundRemoval::Params wf_params_;
+};
+
+int main(int argc, char ** argv)
+{
+  rclcpp::init(argc, argv);
+  auto node = std::make_shared<DepthClusteringNode>();
+  rclcpp::spin(node);
+  rclcpp::shutdown();
+  return 0;
+}

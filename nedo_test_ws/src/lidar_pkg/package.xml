@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>lidar_pkg</name>
+  <version>0.2.0</version>
+  <description>URG LaserScan to filtered obstacle PointCloud2 converter.</description>
+  <maintainer email="yosi4@localhost.localdomain">Hayashi Laboratory</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

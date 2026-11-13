@@ -1,0 +1,20 @@
+scan_shadow_filter_node:
+  ros__parameters:
+    # 実験機で検証済みの URG 影除去条件を初期値として使用する。
+    raw_mode: false
+    invert_vertical: true
+    threshold: 0.30
+    proximity_radius: 1.50
+    angle_min_deg: -90.0
+    angle_max_deg: 90.0
+
+    # URG 座標から base_link 座標へ変換する実験機の取付値。
+    output_frame_id: "base_link"
+    laser_offset_x: -1.0
+    laser_offset_y: -1.0
+    laser_offset_yaw: 0.0
+
+    # 機体自身および無効な近距離値を障害物点群から除く。
+    min_range: 0.01
+    min_radius_robot: 0.30
+    epsilon_radius: 0.00

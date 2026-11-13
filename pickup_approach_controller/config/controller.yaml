@@ -1,0 +1,89 @@
+pickup_approach_controller:
+  ros__parameters:
+    # 実機指令は、結線試験と安全監視の確認が終わるまで無効にします。
+    # master.launch.py では cmd_vel_mux が排他選択するため、専用入力へ実指令を出します。
+    publish_motion_commands: true
+    enable_straight_line_fallback: false
+    require_environment_guard: true
+    require_monitor_enabled: true      # 山監視ノードが無効の間は走行しない
+    publish_navigation_result: true
+
+    control_rate_hz: 50.0
+    # 自己位置は実測約10 Hz（周期変動時は最大0.20 s）。0.10 sでは正常データも
+    # 周期の谷間で無効になり、経路受理・到着判定が停止するため余裕を持たせる。
+    maximum_localization_age: 0.25
+    maximum_environment_age: 0.25
+    maximum_position_variance: 0.01
+    maximum_yaw_variance: 0.007615435
+    pose_jump_threshold: 0.10          # [m] 再位置合わせ(飛び)と見なす位置差
+    yaw_jump_threshold: 0.10           # [rad]
+    localization_hold_seconds: 0.5     # 飛び検出後の停止保持時間 [s]
+    maximum_start_position_error: 0.10 # 経路始点と現在位置の許容差 [m]
+    maximum_start_yaw_error: 0.17      # [rad]
+    require_path_goal_stamp_match: true
+    blocked_hold_seconds: 5.0          # 保持状態がこれ続いたらblockedを通知 [s]
+    straight_path_spacing: 0.02
+
+    frames:
+      map: map
+      base: base_link
+
+    topics:
+      odometry: /odometry/filtered
+      # /pickup_pose は把持計画の生出力です。マスターが走行権限を取得した後に
+      # この専用トピックへ中継し、巡回走行系との同時動作を防ぎます。
+      goal: /pickup_approach/goal
+      path: /pickup_approach/path
+      too_close: /scrap_pile_skirt_node/too_close
+      monitor_enabled: /scrap_pile_skirt_node/enabled
+      command: /pickup_approach/cmd_vel
+      debug_command: /pickup_approach/debug_cmd_vel
+      result: /pickup_approach/result
+      status: /pickup_approach/status
+      navigation_result: /navigation/result
+
+    # 立上げ用の控えめな値。実機で段階的に上げてください。
+    controller:
+      maximum_speed: 0.30
+      cruise_speed: 0.25
+      maximum_acceleration: 0.25
+      maximum_jerk: 0.50
+      maximum_snap: 2.0
+      maximum_lateral_acceleration: 0.15
+      path_deceleration: 0.20
+      maximum_yaw_rate: 0.34906585
+      maximum_yaw_acceleration: 0.34906585
+      maximum_longitudinal_recovery_speed: 0.04
+      position_gain: 0.80
+      maximum_correction_speed: 0.16
+      yaw_kp: 1.20
+      yaw_ki: 0.02
+      yaw_kd: 0.10
+      yaw_integral_limit: 0.05235988
+      yaw_derivative_filter_time_constant: 0.50
+      projection_search_back: 0.60
+      projection_search_ahead: 0.80
+      progress_correction_time_constant: 0.10
+      maximum_progress_rate: 0.80
+      curvature_feedforward_gain: 1.0
+      velocity_shaping_gain: 25.0
+      acceleration_shaping_gain: 10.0
+      path_resample_spacing: 0.02
+      curvature_window: 2
+      maximum_heading_step: 0.35
+      path_goal_position_tolerance: 0.01
+      path_goal_yaw_tolerance: 0.02
+      terminal_minimum_speed: 0.0      # 静止摩擦で止まる場合のみ0.03前後へ(要実機確認)
+      maximum_tracking_time: 240.0
+
+    arrival:
+      position_tolerance: 0.020
+      yaw_tolerance: 0.020943951
+      command_speed_tolerance: 0.010
+      command_yaw_rate_tolerance: 0.010
+      window_seconds: 0.8
+      minimum_window_seconds: 0.5
+      minimum_samples: 10
+      confidence_sigma: 2.0
+      maximum_position_drift_rate: 0.005
+      maximum_yaw_drift_rate: 0.008726646

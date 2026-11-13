@@ -1,0 +1,62 @@
+pickup_path_planner:
+  ros__parameters:
+    frames:
+      map: map
+
+    topics:
+      odometry: /odometry/filtered
+      # マスターが接近制御の権限取得後に発行する専用目標です。
+      goal: /pickup_approach/goal
+      skirt_points: /scrap_pile_skirt_node/skirt_points
+      path: /pickup_approach/path
+      status: /pickup_approach/planner_status
+      result: /pickup_approach/plan_result
+      navigation_result: /navigation/result
+
+    # 計画を始める前提条件（満たされるまで待ち、planning_timeoutで失敗を通知）
+    maximum_localization_age: 0.20
+    planning_timeout: 5.0
+    planning_rate_hz: 10.0
+    stationary_speed: 0.03          # [m/s] これ以下を静止と見なす
+    stationary_yaw_rate: 0.03       # [rad/s]
+    maximum_position_variance: 0.01
+    maximum_yaw_variance: 0.007615435
+    require_cloud_not_older_than_goal: true
+    goal_cloud_tolerance: 0.5       # [s]
+    skirt_max_height: -1.0          # 正の値なら、これより高い点を裾点から除外 [m]
+    maximum_cloud_points: 20000
+    # 計画失敗の blocked はmasterへ通知する。一方、planned は経路を実際に
+    # 受理した pickup_approach_controller だけが通知し、早すぎる状態遷移を防ぐ。
+    publish_navigation_result: true
+    publish_navigation_planned: false
+
+    # 車体矩形。base_link が車体矩形の中心であることを前提とします（要確認）。
+    robot:
+      # body_length: 4.150
+      # body_width: 1.800
+      body_length: 1.800
+      body_width: 1.00
+
+    planner:
+      # scrap_pile_skirt_node の接近限界 0.30 m に準拠し、停止・追従余裕を加える:
+      # 0.30 m × 133% ≒ 0.40 m（経路計画値を実行時停止閾値より小さくしない）
+      body_clearance: 0.40
+      tracking_error_allowance: 0.10
+      transition_distance: 0.50
+      orbit_extra_clearance: 0.25
+      path_visible_sector_margin: 3.14159265
+      search_step: 0.08
+      output_step: 0.02
+      validation_step: 0.02
+      maximum_path_length_ratio: 4.0
+
+    pile_model:
+      minimum_skirt_points: 12
+      minimum_visible_arc: 1.57079633   # 90 deg
+      residual_coverage: 0.95
+      radial_uncertainty: 0.01
+      polygon_samples: 180
+      circle_iterations: 6
+      maximum_pile_radius: 2.5
+      minimum_pile_radius: 0.4
+      maximum_circle_residual: 0.15
